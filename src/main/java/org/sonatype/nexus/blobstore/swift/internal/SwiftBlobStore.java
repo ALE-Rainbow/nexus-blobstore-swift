@@ -24,10 +24,7 @@ import org.javaswift.joss.model.StoredObject;
 import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.sonatype.nexus.blobstore.BlobIdLocationResolver;
-import org.sonatype.nexus.blobstore.BlobSupport;
-import org.sonatype.nexus.blobstore.MetricsInputStream;
-import org.sonatype.nexus.blobstore.StreamMetrics;
+import org.sonatype.nexus.blobstore.*;
 import org.sonatype.nexus.blobstore.api.Blob;
 import org.sonatype.nexus.blobstore.api.BlobAttributes;
 import org.sonatype.nexus.blobstore.api.BlobId;
@@ -37,6 +34,7 @@ import org.sonatype.nexus.blobstore.api.BlobStoreConfiguration;
 import org.sonatype.nexus.blobstore.api.BlobStoreException;
 import org.sonatype.nexus.blobstore.api.BlobStoreMetrics;
 import org.sonatype.nexus.blobstore.api.BlobStoreUsageChecker;
+import org.sonatype.nexus.common.log.DryRunPrefix;
 import org.sonatype.nexus.common.stateguard.Guarded;
 import org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport;
 
@@ -48,6 +46,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.stream.Stream;
@@ -58,6 +57,7 @@ import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.cache.CacheLoader.from;
 import static java.lang.String.format;
 import static org.sonatype.nexus.blobstore.DirectPathLocationStrategy.DIRECT_PATH_ROOT;
+import static org.sonatype.nexus.blobstore.api.BlobAttributesConstants.HEADER_PREFIX;
 import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.FAILED;
 import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.NEW;
 import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.STARTED;
@@ -67,7 +67,7 @@ import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.St
  * A {@link BlobStore} that stores its content in Openstack SWIFT
  */
 @Named(SwiftBlobStore.TYPE)
-public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobStore {
+public class SwiftBlobStore extends BlobStoreSupport<AttributesLocation> {
 
   private final Logger timerlog = LoggerFactory.getLogger(SwiftBlobStore.class.getName()+"-timer");
 
@@ -102,14 +102,19 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
   private LoadingCache<BlobId, SwiftBlob> liveBlobs;
   private Account swift;
 
+  private final DryRunPrefix dryRunPrefix;
+
   @Inject
   public SwiftBlobStore(final SwiftClientFactory swiftClientFactory,
                         final BlobIdLocationResolver blobIdLocationResolver,
-                        final SwiftBlobStoreMetricsStore storeMetrics)
+                        final SwiftBlobStoreMetricsStore storeMetrics,
+                        final DryRunPrefix dryRunPrefix)
   {
+    super(blobIdLocationResolver, dryRunPrefix);
     this.swiftClientFactory = checkNotNull(swiftClientFactory);
     this.blobIdLocationResolver = checkNotNull(blobIdLocationResolver);
     this.storeMetrics = checkNotNull(storeMetrics);
+    this.dryRunPrefix = dryRunPrefix;
   }
 
   @Override
@@ -191,6 +196,16 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
     } finally {
       timerlog.debug("create(...) took: " + stopwatch);
     }
+  }
+
+  @Override
+  public Blob create(InputStream inputStream, Map<String, String> map, @Nullable BlobId blobId) {
+    return null;
+  }
+
+  @Override
+  protected Blob doCreate(InputStream inputStream, Map<String, String> map, @Nullable BlobId blobId) {
+    return null;
   }
 
   @Override
@@ -303,6 +318,17 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
     }
   }
 
+  /**
+   * @return true if a blob exists in the store with the provided {@link BlobId}
+   * @throws BlobStoreException if an IOException occurs
+   */
+  @Override
+  @Guarded(by = STARTED)
+  public boolean exists(final BlobId blobId) {
+    checkNotNull(blobId);
+    return getBlobAttributes(blobId) != null;
+  }
+
   @Override
   @Guarded(by = STARTED)
   public boolean delete(final BlobId blobId, String reason) {
@@ -347,6 +373,44 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
   }
 
   @Override
+  protected boolean doDelete(final BlobId blobId, final String reason) {
+    final SwiftBlob blob = liveBlobs.getUnchecked(blobId);
+
+    Lock lock = blob.lock();
+    try {
+      log.debug("Soft deleting blob {}", blobId);
+
+      SwiftBlobAttributes blobAttributes = new SwiftBlobAttributes(swift, getConfiguredContainer(), attributePath(blobId));
+
+      boolean loaded = blobAttributes.load();
+      if (!loaded) {
+        // This could happen under some concurrent situations (two threads try to delete the same blob)
+        // but it can also occur if the deleted index refers to a manually-deleted blob.
+        log.warn("Attempt to mark-for-delete non-existent blob {}", blobId);
+        return false;
+      }
+      else if (blobAttributes.isDeleted()) {
+        log.debug("Attempt to delete already-deleted blob {}", blobId);
+        return false;
+      }
+
+      blobAttributes.setDeleted(true);
+      blobAttributes.setDeletedReason(reason);
+      blobAttributes.store();
+
+      blob.markStale();
+
+      return true;
+    }
+    catch (Exception e) {
+      throw new BlobStoreException(e, blobId);
+    }
+    finally {
+      lock.unlock();
+    }
+  }
+
+  @Override
   @Guarded(by = STARTED)
   public boolean deleteHard(final BlobId blobId) {
     Stopwatch stopwatch = Stopwatch.createStarted();
@@ -382,6 +446,35 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
     }
   }
 
+  @Override
+  protected boolean doDeleteHard(BlobId blobId) {
+    try {
+      log.debug("Hard deleting blob {}", blobId);
+
+      String attributePath = attributePath(blobId);
+      SwiftBlobAttributes blobAttributes = new SwiftBlobAttributes(swift, getConfiguredContainer(), attributePath);
+      Long contentSize = getContentSizeForDeletion(blobAttributes);
+
+      String blobPath = contentPath(blobId);
+
+      boolean blobDeleted = autoRetry(() -> delete(blobPath));
+      autoRetry(() -> delete(attributePath));
+
+      if (blobDeleted && contentSize != null) {
+        storeMetrics.recordDeletion(contentSize);
+      }
+
+      return blobDeleted;
+
+    }
+    catch (Exception e) {
+      throw new BlobStoreException(e, blobId);
+    }
+    finally {
+      liveBlobs.invalidate(blobId);
+    }
+  }
+
   @Nullable
   private Long getContentSizeForDeletion(final SwiftBlobAttributes blobAttributes) {
     try {
@@ -409,12 +502,17 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
   @Override
   @Guarded(by = STARTED)
   public synchronized void compact(@Nullable final BlobStoreUsageChecker inUseChecker) {
-      // no-op
+    // no-op
   }
 
   @Override
   public BlobStoreConfiguration getBlobStoreConfiguration() {
     return this.blobStoreConfiguration;
+  }
+
+  @Override
+  protected BlobAttributes getBlobAttributes(AttributesLocation attributesLocation) throws IOException {
+    return null;
   }
 
   @Override
@@ -431,6 +529,19 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
       setConfiguredContainer(getConfiguredContainer());
     } catch (Exception e) {
       throw new BlobStoreException("Unable to initialize blob store bucket: " + getConfiguredContainer(), e, null);
+    }
+  }
+
+  @Override
+  protected void doInit(BlobStoreConfiguration blobStoreConfiguration) {
+    try {
+      swift = swiftClientFactory.create(blobStoreConfiguration);
+      if (!swift.getContainer(getConfiguredContainer()).exists()) {
+        swift.getContainer(getConfiguredContainer()).create();
+      }
+    }
+    catch (Exception e) {
+      throw new BlobStoreException("Unable to initialize blob store container", e, null);
     }
   }
 
@@ -473,7 +584,7 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
           }
         });
       } catch (IOException e) {
-          throw new BlobStoreException(e, null);
+        throw new BlobStoreException(e, null);
       }
     } finally {
       timerlog.debug("remove(...) took: " + stopwatch);
@@ -540,8 +651,73 @@ public class SwiftBlobStore extends StateGuardLifecycleSupport implements BlobSt
     }
     catch (Exception e) {
       log.error("Unable to set BlobAttributes for blob id: {}, exception: {}",
-          blobId, e.getMessage(), log.isDebugEnabled() ? e : null);
+              blobId, e.getMessage(), log.isDebugEnabled() ? e : null);
     }
+  }
+
+  @Override
+  @Guarded(by = STARTED)
+  public boolean undelete(@Nullable final BlobStoreUsageChecker blobStoreUsageChecker,
+                          final BlobId blobId,
+                          final BlobAttributes attributes,
+                          final boolean isDryRun)
+  {
+    checkNotNull(attributes);
+    String logPrefix = isDryRun ? dryRunPrefix.get() : "";
+    Optional<String> blobName = Optional.of(attributes)
+            .map(BlobAttributes::getProperties)
+            .map(p -> p.getProperty(HEADER_PREFIX + BLOB_NAME_HEADER));
+    if (!blobName.isPresent()) {
+      log.error("Property not present: {}, for blob id: {}, at path: {}", HEADER_PREFIX + BLOB_NAME_HEADER,
+              blobId, attributePath(blobId));
+      return false;
+    }
+    if (attributes.isDeleted() && blobStoreUsageChecker != null &&
+            blobStoreUsageChecker.test(this, blobId, blobName.get())) {
+      String deletedReason = attributes.getDeletedReason();
+      if (!isDryRun) {
+        attributes.setDeleted(false);
+        attributes.setDeletedReason(null);
+        try {
+          attributes.store();
+        }
+        catch (IOException e) {
+          log.error("Error while un-deleting blob id: {}, deleted reason: {}, blob store: {}, blob name: {}",
+                  blobId, deletedReason, blobStoreConfiguration.getName(), blobName.get(), e);
+        }
+      }
+      log.warn(
+              "{}Soft-deleted blob still in use, un-deleting blob id: {}, deleted reason: {}, blob store: {}, blob name: {}",
+              logPrefix, blobId, deletedReason, blobStoreConfiguration.getName(), blobName.get());
+      return true;
+    }
+    return false;
+  }
+
+  @Override
+  protected String attributePathString(BlobId blobId) {
+    return null;
+  }
+
+
+  @Override
+  public boolean isStorageAvailable() {
+    return true;
+  }
+
+  @Override
+  public boolean isGroupable() {
+    return false;
+  }
+
+  @Override
+  public boolean isWritable() {
+    return false;
+  }
+
+  @Override
+  public boolean isEmpty() {
+    return false;
   }
 
   @FunctionalInterface

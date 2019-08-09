@@ -13,6 +13,7 @@
 package org.sonatype.nexus.blobstore.swift.internal;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -21,15 +22,17 @@ import java.util.stream.Stream;
 import javax.inject.Inject;
 import javax.inject.Named;
 
+import com.google.common.collect.ImmutableMap;
 import org.javaswift.joss.model.Account;
 import org.javaswift.joss.model.Directory;
 import org.sonatype.nexus.blobstore.AccumulatingBlobStoreMetrics;
+import org.sonatype.nexus.blobstore.BlobStoreMetricsStoreSupport;
 import org.sonatype.nexus.blobstore.api.BlobStoreMetrics;
-import org.sonatype.nexus.blobstore.PeriodicJobService;
-import org.sonatype.nexus.blobstore.PeriodicJobService.PeriodicJob;
+import org.sonatype.nexus.blobstore.quota.BlobStoreQuotaService;
 import org.sonatype.nexus.common.node.NodeAccess;
 import org.sonatype.nexus.common.stateguard.Guarded;
 import org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport;
+import org.sonatype.nexus.scheduling.PeriodicJobService;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
@@ -37,11 +40,15 @@ import static java.lang.Long.parseLong;
 import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.STARTED;
 
 /**
- * A {@link BlobStoreMetricsStore} implementation that retains blobstore metrics in memory, periodically
+ * A {@link BlobStoreMetricsStoreSupport} implementation that retains blobstore metrics in memory, periodically
  * writing them out to AWS S3.
  */
 @Named
-public class SwiftBlobStoreMetricsStore extends StateGuardLifecycleSupport {
+public class SwiftBlobStoreMetricsStore extends BlobStoreMetricsStoreSupport<SwiftPropertiesFile> {
+
+  private static final Map<String, Long> AVAILABLE_SPACE_BY_FILE_STORE = ImmutableMap
+          .of(SwiftBlobStore.CONFIG_KEY, Long.MAX_VALUE);
+
   private static final String METRICS_SUFFIX = "metrics";
   private static final String METRICS_EXTENSION = ".properties";
   private static final String TOTAL_SIZE_PROP_NAME = "totalSize";
@@ -54,14 +61,20 @@ public class SwiftBlobStoreMetricsStore extends StateGuardLifecycleSupport {
   private AtomicLong totalSize;
   private AtomicBoolean dirty;
   private AtomicReference<Directory> directory;
-  private PeriodicJob metricsWritingJob;
+  private PeriodicJobService.PeriodicJob metricsWritingJob;
   private String container;
   private SwiftPropertiesFile propertiesFile;
 
   private Account swift;
 
   @Inject
-  public SwiftBlobStoreMetricsStore(final PeriodicJobService jobService, final NodeAccess nodeAccess) {
+  public SwiftBlobStoreMetricsStore(final PeriodicJobService jobService,
+                                    final NodeAccess nodeAccess,
+                                    final BlobStoreQuotaService quotaService,
+                                    @Named("${nexus.blobstore.quota.warnIntervalSeconds:-60}")
+                                    final int quotaCheckInterval)
+  {
+    super(nodeAccess, jobService, quotaService, quotaCheckInterval);
     this.jobService = checkNotNull(jobService);
     this.nodeAccess = checkNotNull(nodeAccess);
   }
@@ -102,16 +115,13 @@ public class SwiftBlobStoreMetricsStore extends StateGuardLifecycleSupport {
   }
 
   @Override
-  protected void doStop() throws Exception {
-    metricsWritingJob.cancel();
-    metricsWritingJob = null;
-    jobService.stopUsing();
+  protected SwiftPropertiesFile getProperties() {
+    return new SwiftPropertiesFile(swift, container, directory.get(), METRICS_FILENAME);
+  }
 
-    blobCount = null;
-    totalSize = null;
-    dirty = null;
-
-    propertiesFile = null;
+  @Override
+  protected AccumulatingBlobStoreMetrics getAccumulatingBlobStoreMetrics() {
+    return new AccumulatingBlobStoreMetrics(0, 0, AVAILABLE_SPACE_BY_FILE_STORE, true);
   }
 
   public void setContainer(final String container) {
@@ -132,53 +142,25 @@ public class SwiftBlobStoreMetricsStore extends StateGuardLifecycleSupport {
     return getCombinedMetrics(blobStoreMetricsFiles);
   }
 
-  private BlobStoreMetrics getCombinedMetrics(final Stream<SwiftPropertiesFile> blobStoreMetricsFiles) {
-    AccumulatingBlobStoreMetrics blobStoreMetrics = new AccumulatingBlobStoreMetrics(0, 0, -1, true);
-
-    blobStoreMetricsFiles.forEach(metricsFile -> {
-        try {
-          metricsFile.load();
-          blobStoreMetrics.addBlobCount(parseLong(metricsFile.getProperty(BLOB_COUNT_PROP_NAME, "0")));
-          blobStoreMetrics.addTotalSize(parseLong(metricsFile.getProperty(TOTAL_SIZE_PROP_NAME, "0")));
-        } catch (IOException e) {
-          throw new RuntimeException(e);
-        }
-    });
-    return blobStoreMetrics;
-  }
-
-  @Guarded(by = STARTED)
-  public void recordAddition(final long size) {
-    blobCount.incrementAndGet();
-    totalSize.addAndGet(size);
-    dirty.set(true);
-  }
-
-  @Guarded(by = STARTED)
-  public void recordDeletion(final long size) {
-    blobCount.decrementAndGet();
-    totalSize.addAndGet(-size);
-    dirty.set(true);
-  }
-
   public void remove() {
     backingFiles().forEach(metricsFile -> {
-        try {
-          metricsFile.remove();
-        }
-        catch (IOException e) {
-          throw new RuntimeException(e);
-        }
+      try {
+        metricsFile.remove();
+      }
+      catch (IOException e) {
+        throw new RuntimeException(e);
+      }
     });
   }
 
-  private Stream<SwiftPropertiesFile> backingFiles() {
+  @Override
+  protected Stream<SwiftPropertiesFile> backingFiles() {
     if (swift == null) {
       return Stream.empty();
     } else {
       Stream<SwiftPropertiesFile> stream = swift.getContainer(container).listDirectory(directory.get()).stream()
-          .filter(summary -> summary.getName().endsWith(METRICS_EXTENSION))
-          .map(summary -> new SwiftPropertiesFile(swift, container, directory.get(), summary.getName()));
+              .filter(summary -> summary.getName().endsWith(METRICS_EXTENSION))
+              .map(summary -> new SwiftPropertiesFile(swift, container, directory.get(), summary.getName()));
       return stream;
     }
   }

@@ -18,6 +18,7 @@ import org.javaswift.joss.model.StoredObject
 import org.sonatype.nexus.blobstore.BlobIdLocationResolver
 import org.sonatype.nexus.blobstore.api.BlobId
 import org.sonatype.nexus.blobstore.api.BlobStoreConfiguration
+import org.sonatype.nexus.common.log.DryRunPrefix
 import spock.lang.Specification
 
 import static java.util.UUID.randomUUID
@@ -32,8 +33,9 @@ class SwiftBlobStoreTest
   SwiftClientFactory swiftClientFactory = Mock()
   BlobIdLocationResolver locationResolver = Mock()
   SwiftBlobStoreMetricsStore storeMetrics = Mock()
+  DryRunPrefix dryRunPrefix = Mock()
   Account swift = Mock()
-  SwiftBlobStore blobStore = new SwiftBlobStore(swiftClientFactory, locationResolver, storeMetrics)
+  SwiftBlobStore blobStore = new SwiftBlobStore(swiftClientFactory, locationResolver, storeMetrics, dryRunPrefix)
 
   def config = new BlobStoreConfiguration()
 

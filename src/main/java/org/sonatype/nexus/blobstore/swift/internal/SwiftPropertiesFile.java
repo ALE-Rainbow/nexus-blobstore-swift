@@ -24,13 +24,14 @@ import org.javaswift.joss.model.Directory;
 import org.javaswift.joss.model.StoredObject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.sonatype.nexus.common.property.ImplicitSourcePropertiesFile;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 
 /**
  * Persistent properties file stored in Openstack swift.
  */
-public class SwiftPropertiesFile extends Properties {
+public class SwiftPropertiesFile extends ImplicitSourcePropertiesFile {
   private static final Logger log = LoggerFactory.getLogger(SwiftPropertiesFile.class);
   private static final Logger timerlog = LoggerFactory.getLogger(SwiftPropertiesFile.class.getName()+"-timer");
   private final Account swift;
@@ -85,8 +86,8 @@ public class SwiftPropertiesFile extends Properties {
 
   public String toString() {
     return getClass().getSimpleName() + "{" +
-        "container=" + container +
-        ", key=" + key +
-        '}';
+            "container=" + container +
+            ", key=" + key +
+            '}';
   }
 }

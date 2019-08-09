@@ -16,6 +16,7 @@ import com.google.common.base.Strings;
 import org.javaswift.joss.client.factory.AccountFactory;
 import org.javaswift.joss.client.factory.AuthenticationMethod;
 import org.javaswift.joss.model.Account;
+import org.sonatype.goodies.common.ComponentSupport;
 import org.sonatype.nexus.blobstore.api.BlobStoreConfiguration;
 import org.sonatype.nexus.common.collect.NestedAttributesMap;
 
@@ -34,7 +35,8 @@ import static org.sonatype.nexus.blobstore.swift.internal.SwiftBlobStore.USERNAM
  * Creates configured Swift {@link Account} respresenting a openstack swift client.
  */
 @Named
-public class SwiftClientFactory {
+public class SwiftClientFactory
+        extends ComponentSupport {
 
   private static final int DEFAULT_SOCKET_TIMEOUT = 5000;
 
