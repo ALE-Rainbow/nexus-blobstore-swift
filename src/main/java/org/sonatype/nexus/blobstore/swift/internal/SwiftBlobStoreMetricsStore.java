@@ -12,58 +12,40 @@
  */
 package org.sonatype.nexus.blobstore.swift.internal;
 
-import java.io.IOException;
-import java.util.Map;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.stream.Stream;
-
-import javax.inject.Inject;
-import javax.inject.Named;
-
 import com.google.common.collect.ImmutableMap;
 import org.javaswift.joss.model.Account;
 import org.javaswift.joss.model.Directory;
 import org.sonatype.nexus.blobstore.AccumulatingBlobStoreMetrics;
 import org.sonatype.nexus.blobstore.BlobStoreMetricsStoreSupport;
-import org.sonatype.nexus.blobstore.api.BlobStoreMetrics;
 import org.sonatype.nexus.blobstore.quota.BlobStoreQuotaService;
 import org.sonatype.nexus.common.node.NodeAccess;
-import org.sonatype.nexus.common.stateguard.Guarded;
-import org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport;
 import org.sonatype.nexus.scheduling.PeriodicJobService;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Stream;
 
 import static com.google.common.base.Preconditions.checkNotNull;
 import static com.google.common.base.Preconditions.checkState;
-import static java.lang.Long.parseLong;
-import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.STARTED;
 
 /**
- * A {@link BlobStoreMetricsStoreSupport} implementation that retains blobstore metrics in memory, periodically
- * writing them out to AWS S3.
+ * A S3 specific {@link BlobStoreMetricsStoreSupport} implementation that retains blobstore metrics in memory,
+ * periodically writing them out to S3.
+ *
+ * @since 3.6.1
  */
 @Named
 public class SwiftBlobStoreMetricsStore extends BlobStoreMetricsStoreSupport<SwiftPropertiesFile> {
 
-  private static final Map<String, Long> AVAILABLE_SPACE_BY_FILE_STORE = ImmutableMap
+  private static final ImmutableMap<String, Long> AVAILABLE_SPACE_BY_FILE_STORE = ImmutableMap
           .of(SwiftBlobStore.CONFIG_KEY, Long.MAX_VALUE);
 
-  private static final String METRICS_SUFFIX = "metrics";
   private static final String METRICS_EXTENSION = ".properties";
-  private static final String TOTAL_SIZE_PROP_NAME = "totalSize";
-  private static final String BLOB_COUNT_PROP_NAME = "blobCount";
-  private static final int METRICS_FLUSH_PERIOD_SECONDS = 2;
 
-  private final PeriodicJobService jobService;
-  private AtomicLong blobCount;
-  private final NodeAccess nodeAccess;
-  private AtomicLong totalSize;
-  private AtomicBoolean dirty;
   private AtomicReference<Directory> directory;
-  private PeriodicJobService.PeriodicJob metricsWritingJob;
   private String container;
-  private SwiftPropertiesFile propertiesFile;
 
   private Account swift;
 
@@ -75,47 +57,11 @@ public class SwiftBlobStoreMetricsStore extends BlobStoreMetricsStoreSupport<Swi
                                     final int quotaCheckInterval)
   {
     super(nodeAccess, jobService, quotaService, quotaCheckInterval);
-    this.jobService = checkNotNull(jobService);
-    this.nodeAccess = checkNotNull(nodeAccess);
-  }
-
-  @Override
-  protected void doStart() throws Exception {
-    blobCount = new AtomicLong();
-    totalSize = new AtomicLong();
-    dirty = new AtomicBoolean();
-    directory = new AtomicReference(new Directory(nodeAccess.getId(), '/'));
-
-    propertiesFile = new SwiftPropertiesFile(swift, container, directory.get(), METRICS_SUFFIX + METRICS_EXTENSION);
-    if (propertiesFile.exists()) {
-      log.info("Loading blob store metrics file {}", propertiesFile);
-      propertiesFile.load();
-      readProperties();
-    }
-    else {
-      log.info("Blob store metrics file {} not found - initializing at zero.", propertiesFile);
-      updateProperties();
-      propertiesFile.store();
-    }
-
-    jobService.startUsing();
-    metricsWritingJob = jobService.schedule(() -> {
-      try {
-        if (dirty.compareAndSet(true, false)) {
-          updateProperties();
-          log.trace("Writing blob store metrics to {}", propertiesFile);
-          propertiesFile.store();
-        }
-      }
-      catch (Exception e) {
-        // Don't propagate, as this stops subsequent executions
-        log.error("Cannot write blob store metrics", e);
-      }
-    }, METRICS_FLUSH_PERIOD_SECONDS);
   }
 
   @Override
   protected SwiftPropertiesFile getProperties() {
+    directory = new AtomicReference(new Directory(nodeAccess.getId(), '/'));
     return new SwiftPropertiesFile(swift, container, directory.get(), METRICS_FILENAME);
   }
 
@@ -136,23 +82,6 @@ public class SwiftBlobStoreMetricsStore extends BlobStoreMetricsStoreSupport<Swi
     this.swift = swift;
   }
 
-  @Guarded(by = STARTED)
-  public BlobStoreMetrics getMetrics() {
-    Stream<SwiftPropertiesFile> blobStoreMetricsFiles = backingFiles();
-    return getCombinedMetrics(blobStoreMetricsFiles);
-  }
-
-  public void remove() {
-    backingFiles().forEach(metricsFile -> {
-      try {
-        metricsFile.remove();
-      }
-      catch (IOException e) {
-        throw new RuntimeException(e);
-      }
-    });
-  }
-
   @Override
   protected Stream<SwiftPropertiesFile> backingFiles() {
     if (swift == null) {
@@ -165,20 +94,16 @@ public class SwiftBlobStoreMetricsStore extends BlobStoreMetricsStoreSupport<Swi
     }
   }
 
-  private void updateProperties() {
-    propertiesFile.setProperty(TOTAL_SIZE_PROP_NAME, totalSize.toString());
-    propertiesFile.setProperty(BLOB_COUNT_PROP_NAME, blobCount.toString());
-  }
-
-  private void readProperties() {
-    String size = propertiesFile.getProperty(TOTAL_SIZE_PROP_NAME);
-    if (size != null) {
-      totalSize.set(parseLong(size));
-    }
-
-    String count = propertiesFile.getProperty(BLOB_COUNT_PROP_NAME);
-    if (count != null) {
-      blobCount.set(parseLong(count));
-    }
+  @Override
+  public void remove() {
+    backingFiles().forEach(metricsFile -> {
+      try {
+        log.debug("Removing {}", metricsFile);
+        metricsFile.remove();
+      }
+      catch (IOException e) {
+        throw new RuntimeException(e);
+      }
+    });
   }
 }

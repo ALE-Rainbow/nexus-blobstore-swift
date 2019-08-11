@@ -25,24 +25,14 @@ import org.joda.time.DateTime;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.blobstore.*;
-import org.sonatype.nexus.blobstore.api.Blob;
-import org.sonatype.nexus.blobstore.api.BlobAttributes;
-import org.sonatype.nexus.blobstore.api.BlobId;
-import org.sonatype.nexus.blobstore.api.BlobMetrics;
-import org.sonatype.nexus.blobstore.api.BlobStore;
-import org.sonatype.nexus.blobstore.api.BlobStoreConfiguration;
-import org.sonatype.nexus.blobstore.api.BlobStoreException;
-import org.sonatype.nexus.blobstore.api.BlobStoreMetrics;
-import org.sonatype.nexus.blobstore.api.BlobStoreUsageChecker;
+import org.sonatype.nexus.blobstore.api.*;
 import org.sonatype.nexus.common.log.DryRunPrefix;
 import org.sonatype.nexus.common.stateguard.Guarded;
-import org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport;
 
 import javax.annotation.Nullable;
 import javax.inject.Inject;
 import javax.inject.Named;
 import java.io.*;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Map;
@@ -51,17 +41,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.stream.Stream;
 
-import static com.google.common.base.Preconditions.checkArgument;
-import static com.google.common.base.Preconditions.checkNotNull;
-import static com.google.common.base.Preconditions.checkState;
+import static com.google.common.base.Preconditions.*;
 import static com.google.common.cache.CacheLoader.from;
 import static java.lang.String.format;
 import static org.sonatype.nexus.blobstore.DirectPathLocationStrategy.DIRECT_PATH_ROOT;
 import static org.sonatype.nexus.blobstore.api.BlobAttributesConstants.HEADER_PREFIX;
-import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.FAILED;
-import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.NEW;
-import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.STARTED;
-import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.STOPPED;
+import static org.sonatype.nexus.common.stateguard.StateGuardLifecycleSupport.State.*;
 
 /**
  * A {@link BlobStore} that stores its content in Openstack SWIFT
@@ -135,6 +120,7 @@ public class SwiftBlobStore extends BlobStoreSupport<AttributesLocation> {
       liveBlobs = CacheBuilder.newBuilder().weakValues().build(from(SwiftBlob::new));
       storeMetrics.setContainer(getConfiguredContainer());
       storeMetrics.setSwift(swift);
+      storeMetrics.setBlobStore(this);
       storeMetrics.start();
     } finally {
       timerlog.debug("doStart() took: " + stopwatch);
@@ -197,16 +183,29 @@ public class SwiftBlobStore extends BlobStoreSupport<AttributesLocation> {
       timerlog.debug("create(...) took: " + stopwatch);
     }
   }
-
+/*
   @Override
   public Blob create(InputStream inputStream, Map<String, String> map, @Nullable BlobId blobId) {
     return null;
   }
 
+ */
+
   @Override
-  protected Blob doCreate(InputStream inputStream, Map<String, String> map, @Nullable BlobId blobId) {
-    return null;
+  protected Blob doCreate(final InputStream blobData,
+                          final Map<String, String> headers,
+                          @Nullable final BlobId blobId)
+  {
+  /*  return create(headers, destination -> {
+      try (InputStream data = blobData) {
+        MetricsInputStream input = new MetricsInputStream(data);
+        swift.getContainer(getConfiguredContainer()).getObject(destination).uploadObject(input);
+        return input.getMetrics();
+      }
+    }, blobId);*/
+    throw new BlobStoreException("Do Create, hard links not supported", null);
   }
+
 
   @Override
   @Guarded(by = STARTED)
